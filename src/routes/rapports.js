@@ -19,5 +19,6 @@ router.get('/prets/pdf',          ctrl.pdfPrets)
 router.get('/prets/excel',        ctrl.excelPrets)
 
 router.get('/bureau/pdf',         ctrl.pdfBureau)
+router.get('/bureau/excel',       ctrl.excelBureau)
 
 module.exports = router

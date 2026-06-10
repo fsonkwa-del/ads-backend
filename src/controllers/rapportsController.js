@@ -668,12 +668,7 @@ async function pdfPrets(req, res, next) {
   } catch (err) { next(err) }
 }
 
-// ── Bureau exécutif (PDF) ──────────────────────────────────────
-const BUREAU_POSTES = [
-  ['PRESIDENT', 'Président'], ['SECRETAIRE', 'Secrétaire'], ['TRESORIER', 'Trésorier'],
-  ['COMMISSAIRE_COMPTES', 'Commissaire aux comptes'], ['CENSEUR', 'Censeur'], ['CHARGE_CULTUREL', 'Chargé culturel'],
-]
-
+// ── Bureau exécutif (PDF / Excel) ──────────────────────────────
 async function getBureauData() {
   try {
     const [[mandat]] = await pool.query("SELECT * FROM bureau_mandats WHERE statut='EN_COURS' ORDER BY numero DESC LIMIT 1")
@@ -684,17 +679,17 @@ async function getBureauData() {
       WHERE bp.mandat_id = ?
       ORDER BY FIELD(bp.role,'TITULAIRE','ADJOINT'), m.nom, m.prenom
     `, [mandat.id])
-    return { mandat, postes }
+    const [defs] = await pool.query('SELECT code, label, ordre, a_adjoint, multiple FROM bureau_postes_def WHERE actif=1 ORDER BY ordre, label')
+    return { mandat, postes, defs: defs.map(d => ({ ...d, a_adjoint: !!d.a_adjoint, multiple: !!d.multiple })) }
   } catch (_) { return null }
 }
+
+const bureauSub = m => `Mandat n°${m.numero}${m.est_renouvellement ? ' (reconduction)' : ''} · du ${fmtDate(m.date_debut)} au ${fmtDate(m.date_fin)}`
 
 async function pdfBureau(req, res, next) {
   try {
     const data = await getBureauData()
-    const sub = data
-      ? `Mandat n°${data.mandat.numero}${data.mandat.est_renouvellement ? ' (reconduction)' : ''} · du ${fmtDate(data.mandat.date_debut)} au ${fmtDate(data.mandat.date_fin)}`
-      : ''
-    const doc = makePDF(res, 'bureau.pdf', 'Bureau exécutif', sub, 'portrait')
+    const doc = makePDF(res, 'bureau.pdf', 'Bureau exécutif', data ? bureauSub(data.mandat) : '', 'portrait')
 
     if (!data) {
       doc.fillColor('#888').font('Helvetica').fontSize(11)
@@ -702,24 +697,26 @@ async function pdfBureau(req, res, next) {
       return finalizePDF(doc)
     }
 
-    const find = (poste, role) => {
-      const c = data.postes.find(x => x.poste === poste && x.role === role)
+    const find = (code, role) => {
+      const c = data.postes.find(x => x.poste === code && x.role === role)
       return c ? `${c.prenom} ${c.nom}` : '—'
     }
     drawTable(doc, {
       title: 'Composition du bureau',
       headers: ['Poste', 'Titulaire', 'Adjoint'],
-      rows: BUREAU_POSTES.map(([k, label]) => [label, find(k, 'TITULAIRE'), find(k, 'ADJOINT')]),
+      rows: data.defs.filter(d => !d.multiple).map(d => [d.label, find(d.code, 'TITULAIRE'), d.a_adjoint ? find(d.code, 'ADJOINT') : '—']),
       colWidths: [180, 170, 170],
     })
 
-    const conseillers = data.postes.filter(p => p.poste === 'CONSEILLER').map(c => `${c.prenom} ${c.nom}`)
-    drawTable(doc, {
-      title: `Conseillers (${conseillers.length})`,
-      headers: ['#', 'Conseiller'],
-      rows: conseillers.length ? conseillers.map((n, i) => [i + 1, n]) : [['—', 'Aucun conseiller désigné']],
-      colWidths: [50, 300],
-    })
+    for (const d of data.defs.filter(x => x.multiple)) {
+      const list = data.postes.filter(p => p.poste === d.code).map(c => `${c.prenom} ${c.nom}`)
+      drawTable(doc, {
+        title: `${d.label}s (${list.length})`,
+        headers: ['#', d.label],
+        rows: list.length ? list.map((n, i) => [i + 1, n]) : [['—', 'Aucun désigné']],
+        colWidths: [50, 300],
+      })
+    }
 
     if (data.mandat.observations) {
       doc.fillColor('#444').font('Helvetica-Oblique').fontSize(9)
@@ -727,6 +724,38 @@ async function pdfBureau(req, res, next) {
     }
 
     finalizePDF(doc)
+  } catch (err) { next(err) }
+}
+
+async function excelBureau(req, res, next) {
+  try {
+    const data = await getBureauData()
+    const wb = new ExcelJS.Workbook()
+    const ws = wb.addWorksheet('Bureau exécutif')
+
+    if (!data) {
+      xlSheetHeader(ws, 'Bureau exécutif', 'Aucun bureau en cours')
+    } else {
+      xlSheetHeader(ws, 'Bureau exécutif', bureauSub(data.mandat))
+      xlHeader(ws, ['Poste', 'Titulaire', 'Adjoint'], [28, 26, 26])
+      const find = (code, role) => {
+        const c = data.postes.find(x => x.poste === code && x.role === role)
+        return c ? `${c.prenom} ${c.nom}` : '—'
+      }
+      data.defs.filter(d => !d.multiple).forEach((d, i) =>
+        xlData(ws, [d.label, find(d.code, 'TITULAIRE'), d.a_adjoint ? find(d.code, 'ADJOINT') : '—'], i % 2 === 1))
+
+      for (const d of data.defs.filter(x => x.multiple)) {
+        const list = data.postes.filter(p => p.poste === d.code)
+        ws.addRow([])
+        const head = ws.addRow([`${d.label}s (${list.length})`]); head.font = { bold: true, size: 11, color: XL_GREEN }
+        list.forEach((c, i) => xlData(ws, [`${c.prenom} ${c.nom}`], i % 2 === 1))
+      }
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', 'attachment; filename="bureau.xlsx"')
+    await wb.xlsx.write(res); res.end()
   } catch (err) { next(err) }
 }
 
@@ -889,5 +918,5 @@ async function excelPrets(req, res, next) {
 module.exports = {
   rapportReunion, rapportMembres, rapportBilan, rapportPrets,
   pdfReunion, pdfMembres, pdfBilan, pdfPrets, pdfBureau,
-  excelReunion, excelMembres, excelBilan, excelPrets
+  excelReunion, excelMembres, excelBilan, excelPrets, excelBureau
 }

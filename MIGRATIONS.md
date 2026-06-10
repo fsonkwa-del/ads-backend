@@ -20,6 +20,7 @@ mysql -u <user> -p ads_db < <fichier>.sql
 | 5 | `migration_phase4_prets.sql` | Multi-garants (`prets_garants`) + `prets.interet_retenu_source` (avec backfill des garants uniques) |
 | 6 | `migration_phase4_bureau.sql` | Bureau exécutif : `bureau_mandats` + `bureau_postes` (inclut déjà le poste **TRESORIER**) |
 | 7 | `migration_phase4b_tresorier.sql` | Ajoute `TRESORIER` à l'ENUM `bureau_postes.poste`. **Inutile si** la phase 6 a été passée avec la version à jour ; à exécuter uniquement si un bureau avait été créé avec l'ancienne liste de postes. Idempotent. |
+| 8 | `migration_phase4c_postes_perso.sql` | Postes du bureau **personnalisables** : `bureau_postes.poste` ENUM→VARCHAR + table `bureau_postes_def` (définitions + postes statutaires standard). Idempotent. |
 
 ## État connu (10/06/2026)
 - **Base de développement `ads_db`** : toutes les migrations 1→7 sont appliquées.

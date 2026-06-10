@@ -1,31 +1,42 @@
 const pool = require('../config/db')
 
-// Postes nominatifs (titulaire + adjoint). CONSEILLER : multiples, sans adjoint.
-const POSTES = ['PRESIDENT', 'SECRETAIRE', 'TRESORIER', 'COMMISSAIRE_COMPTES', 'CENSEUR', 'CHARGE_CULTUREL', 'CONSEILLER']
-const ROLES  = ['TITULAIRE', 'ADJOINT']
-
 const addYears = (dateStr, n) => {
   const d = new Date(dateStr)
   d.setFullYear(d.getFullYear() + n)
   return d.toISOString().slice(0, 10)
 }
 
-// ── Composition d'un mandat ────────────────────────────────────
+// Slug → code de poste (MAJUSCULES, sans accents)
+function slugCode(label) {
+  return String(label).normalize('NFD').replace(new RegExp('[\\u0300-\\u036f]', 'g'), '')
+    .toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50) || 'POSTE'
+}
+
+// ── Définitions de postes (statutaires + personnalisés) ─────────
+async function getPostesDef(db) {
+  const [rows] = await db.query(
+    'SELECT code, label, ordre, a_adjoint, multiple, systeme FROM bureau_postes_def WHERE actif = 1 ORDER BY ordre, label'
+  )
+  return rows.map(r => ({ ...r, a_adjoint: !!r.a_adjoint, multiple: !!r.multiple, systeme: !!r.systeme }))
+}
+async function getDefMap(db) {
+  return new Map((await getPostesDef(db)).map(d => [d.code, d]))
+}
+
+// ── Composition d'un mandat (ordonnée selon les définitions) ────
 async function getComposition(db, mandatId) {
   const [rows] = await db.query(`
-    SELECT bp.id, bp.membre_id, bp.poste, bp.role, m.nom, m.prenom
-    FROM bureau_postes bp JOIN membres m ON m.id = bp.membre_id
+    SELECT bp.id, bp.membre_id, bp.poste, bp.role, m.nom, m.prenom, COALESCE(d.ordre, 999) AS ordre
+    FROM bureau_postes bp
+    JOIN membres m ON m.id = bp.membre_id
+    LEFT JOIN bureau_postes_def d ON d.code = bp.poste
     WHERE bp.mandat_id = ?
-    ORDER BY FIELD(bp.poste,'PRESIDENT','SECRETAIRE','TRESORIER','COMMISSAIRE_COMPTES','CENSEUR','CHARGE_CULTUREL','CONSEILLER'),
-             FIELD(bp.role,'TITULAIRE','ADJOINT'), m.nom, m.prenom
+    ORDER BY ordre, FIELD(bp.role,'TITULAIRE','ADJOINT'), m.nom, m.prenom
   `, [mandatId])
   return rows
 }
 
-// ── Éligibilité : un membre ne peut faire plus de 2 mandats consécutifs ──
-// Pour un mandat de numéro `targetNumero`, on calcule pour chaque membre actif
-// le nombre de mandats consécutifs (numéros target-1, target-2, …) qu'il a occupés.
-// run >= 2 → l'ajouter à `targetNumero` ferait 3 consécutifs → inéligible.
+// ── Éligibilité : pas plus de 2 mandats consécutifs par membre ──
 async function eligibiliteMembres(db, targetNumero) {
   const [membres] = await db.query("SELECT id, nom, prenom FROM membres WHERE statut='ACTIF' ORDER BY nom, prenom")
   const [rows] = await db.query(`
@@ -44,31 +55,32 @@ async function eligibiliteMembres(db, targetNumero) {
   })
 }
 
-// Valide la cohérence d'une composition (hors règle d'éligibilité)
-function validerComposition(composition) {
+function validerComposition(composition, defMap) {
   const errors = new Set()
   const vusMembres = new Set()
-  const slotsNominatifs = new Set()
+  const slots = new Set()
   for (const c of composition) {
     const mid = Number(c.membre_id)
-    if (!mid || !POSTES.includes(c.poste) || !ROLES.includes(c.role)) {
-      errors.add('Une entrée de composition est invalide.'); continue
-    }
+    const def = defMap.get(c.poste)
+    if (!mid || !def || !['TITULAIRE', 'ADJOINT'].includes(c.role)) { errors.add('Une entrée de composition est invalide.'); continue }
     if (vusMembres.has(mid)) errors.add('Un même membre ne peut occuper deux postes dans le même bureau.')
     vusMembres.add(mid)
-    if (c.poste !== 'CONSEILLER') {
-      if (c.role === 'ADJOINT' && c.poste === 'CONSEILLER') errors.add('Un conseiller n\'a pas d\'adjoint.')
+    if (def.multiple) {
+      if (c.role === 'ADJOINT') errors.add(`Le poste « ${def.label} » n'a pas d'adjoint.`)
+    } else {
+      if (c.role === 'ADJOINT' && !def.a_adjoint) errors.add(`Le poste « ${def.label} » n'a pas d'adjoint.`)
       const slot = `${c.poste}|${c.role}`
-      if (slotsNominatifs.has(slot)) errors.add(`Le poste ${c.poste} (${c.role.toLowerCase()}) est attribué plusieurs fois.`)
-      slotsNominatifs.add(slot)
+      if (slots.has(slot)) errors.add(`Le poste « ${def.label} » (${c.role.toLowerCase()}) est attribué plusieurs fois.`)
+      slots.add(slot)
     }
   }
   return [...errors]
 }
 
-async function insertComposition(conn, mandatId, composition) {
+async function insertComposition(conn, mandatId, composition, defMap) {
   for (const c of composition) {
-    const role = c.poste === 'CONSEILLER' ? 'TITULAIRE' : (c.role === 'ADJOINT' ? 'ADJOINT' : 'TITULAIRE')
+    const def = defMap.get(c.poste)
+    const role = (def && !def.multiple && def.a_adjoint && c.role === 'ADJOINT') ? 'ADJOINT' : 'TITULAIRE'
     await conn.query(
       'INSERT INTO bureau_postes (mandat_id, membre_id, poste, role) VALUES (?, ?, ?, ?)',
       [mandatId, Number(c.membre_id), c.poste, role]
@@ -76,7 +88,6 @@ async function insertComposition(conn, mandatId, composition) {
   }
 }
 
-// Renvoie les membre_id de `ids` inéligibles (déjà 2 mandats consécutifs avant targetNumero)
 async function membresIneligibles(conn, targetNumero, ids) {
   const uniq = [...new Set(ids.map(Number).filter(Boolean))]
   if (!uniq.length) return []
@@ -106,6 +117,7 @@ async function getCurrent(req, res, next) {
         peut_renouveler: !!(mandat && mandat.est_renouvellement === 0),
         prochain_numero: prochainNumero,
         membres:         await eligibiliteMembres(pool, targetNumero),
+        postes_def:      await getPostesDef(pool),
       }
     })
   } catch (err) { next(err) }
@@ -133,7 +145,8 @@ async function createMandat(req, res, next) {
     const [[encours]] = await pool.query("SELECT id FROM bureau_mandats WHERE statut='EN_COURS' LIMIT 1")
     if (encours) return res.status(400).json({ success: false, message: 'Un mandat est déjà en cours. Clôturez-le avant d\'élire un nouveau bureau.' })
 
-    const errs = validerComposition(composition)
+    const defMap = await getDefMap(pool)
+    const errs = validerComposition(composition, defMap)
     if (errs.length) return res.status(400).json({ success: false, message: errs.join(' ') })
 
     conn = await pool.getConnection(); await conn.beginTransaction()
@@ -150,7 +163,7 @@ async function createMandat(req, res, next) {
       'INSERT INTO bureau_mandats (numero, date_debut, date_fin, est_renouvellement, statut, observations) VALUES (?, ?, ?, 0, ?, ?)',
       [numero, date_debut, fin, 'EN_COURS', observations || null]
     )
-    await insertComposition(conn, r.insertId, composition)
+    await insertComposition(conn, r.insertId, composition, defMap)
     await conn.commit()
     res.status(201).json({ success: true, data: { id: r.insertId, numero } })
   } catch (err) { if (conn) await conn.rollback(); next(err) } finally { if (conn) conn.release() }
@@ -181,7 +194,8 @@ async function updateMandat(req, res, next) {
     }
 
     if (Array.isArray(composition)) {
-      const errs = validerComposition(composition)
+      const defMap = await getDefMap(conn)
+      const errs = validerComposition(composition, defMap)
       if (errs.length) { await conn.rollback(); return res.status(400).json({ success: false, message: errs.join(' ') }) }
       const inel = await membresIneligibles(conn, mandat.numero, composition.map(c => c.membre_id))
       if (inel.length) {
@@ -189,7 +203,7 @@ async function updateMandat(req, res, next) {
         return res.status(400).json({ success: false, message: `Membre(s) ayant déjà effectué 2 mandats consécutifs (inéligible) : ${await nomsMembres(pool, inel)}` })
       }
       await conn.query('DELETE FROM bureau_postes WHERE mandat_id = ?', [id])
-      await insertComposition(conn, id, composition)
+      await insertComposition(conn, id, composition, defMap)
     }
 
     await conn.commit()
@@ -209,6 +223,7 @@ async function renouveler(req, res, next) {
       return res.status(400).json({ success: false, message: 'Ce mandat est déjà une reconduction (4 ans atteints). Une nouvelle élection est requise.' })
 
     conn = await pool.getConnection(); await conn.beginTransaction()
+    const defMap = await getDefMap(conn)
     const [[maxRow]] = await conn.query('SELECT COALESCE(MAX(numero),0) AS maxn FROM bureau_mandats')
     const numero   = Number(maxRow.maxn) + 1
     const newDebut = date_debut || addYears(mandat.date_debut, 2)
@@ -227,7 +242,7 @@ async function renouveler(req, res, next) {
       'INSERT INTO bureau_mandats (numero, date_debut, date_fin, est_renouvellement, mandat_precedent_id, statut, observations) VALUES (?, ?, ?, 1, ?, ?, ?)',
       [numero, newDebut, newFin, id, 'EN_COURS', mandat.observations]
     )
-    await insertComposition(conn, r.insertId, compo)
+    await insertComposition(conn, r.insertId, compo, defMap)
     await conn.commit()
     res.status(201).json({ success: true, data: { id: r.insertId, numero } })
   } catch (err) { if (conn) await conn.rollback(); next(err) } finally { if (conn) conn.release() }
@@ -255,4 +270,57 @@ async function remove(req, res, next) {
   } catch (err) { next(err) }
 }
 
-module.exports = { getCurrent, getHistorique, createMandat, updateMandat, renouveler, cloturer, remove }
+// ── POSTES PERSONNALISÉS ───────────────────────────────────────
+// POST /api/bureau/postes-def
+async function createPosteDef(req, res, next) {
+  try {
+    const { label, a_adjoint = true } = req.body
+    if (!label || !String(label).trim()) return res.status(400).json({ success: false, message: 'Le libellé du poste est obligatoire.' })
+    let code = slugCode(label)
+    const [[exist]] = await pool.query('SELECT code FROM bureau_postes_def WHERE code = ?', [code])
+    if (exist) code = `${code}_${Date.now().toString().slice(-4)}`
+    const [[{ maxo }]] = await pool.query('SELECT COALESCE(MAX(ordre),0) AS maxo FROM bureau_postes_def WHERE ordre < 100')
+    const ordre = Math.min(99, Number(maxo) + 1)
+    await pool.query(
+      'INSERT INTO bureau_postes_def (code, label, ordre, a_adjoint, multiple, systeme, actif) VALUES (?, ?, ?, ?, 0, 0, 1)',
+      [code, String(label).trim(), ordre, a_adjoint ? 1 : 0]
+    )
+    res.status(201).json({ success: true, data: { code } })
+  } catch (err) { next(err) }
+}
+
+// PUT /api/bureau/postes-def/:code
+async function updatePosteDef(req, res, next) {
+  try {
+    const { code } = req.params
+    const { label, a_adjoint } = req.body
+    const [[def]] = await pool.query('SELECT systeme FROM bureau_postes_def WHERE code = ?', [code])
+    if (!def) return res.status(404).json({ success: false, message: 'Poste introuvable.' })
+    const fields = [], params = []
+    if (label && String(label).trim()) { fields.push('label=?'); params.push(String(label).trim()) }
+    if (a_adjoint !== undefined && !def.systeme) { fields.push('a_adjoint=?'); params.push(a_adjoint ? 1 : 0) }
+    if (!fields.length) return res.json({ success: true, message: 'Rien à modifier.' })
+    params.push(code)
+    await pool.query(`UPDATE bureau_postes_def SET ${fields.join(', ')} WHERE code = ?`, params)
+    res.json({ success: true, message: 'Poste mis à jour.' })
+  } catch (err) { next(err) }
+}
+
+// DELETE /api/bureau/postes-def/:code
+async function deletePosteDef(req, res, next) {
+  try {
+    const { code } = req.params
+    const [[def]] = await pool.query('SELECT systeme FROM bureau_postes_def WHERE code = ?', [code])
+    if (!def) return res.status(404).json({ success: false, message: 'Poste introuvable.' })
+    if (def.systeme) return res.status(400).json({ success: false, message: 'Poste statutaire — non supprimable.' })
+    const [[{ nb }]] = await pool.query('SELECT COUNT(*) AS nb FROM bureau_postes WHERE poste = ?', [code])
+    if (nb > 0) return res.status(400).json({ success: false, message: 'Ce poste est utilisé dans un bureau — impossible de le supprimer.' })
+    await pool.query('DELETE FROM bureau_postes_def WHERE code = ?', [code])
+    res.json({ success: true, message: 'Poste supprimé.' })
+  } catch (err) { next(err) }
+}
+
+module.exports = {
+  getCurrent, getHistorique, createMandat, updateMandat, renouveler, cloturer, remove,
+  createPosteDef, updatePosteDef, deletePosteDef,
+}
