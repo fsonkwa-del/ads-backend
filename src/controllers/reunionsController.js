@@ -1,6 +1,7 @@
 const pool = require('../config/db')
 const { getParam } = require('./pretsController')
-const { arrondirFCFA } = require('../utils/money')
+const { arrondirFCFA, repartirEgal } = require('../utils/money')
+const { reliquatPrecedent } = require('../utils/reliquat')
 
 // ── GET /api/reunions ─────────────────────────────────────────
 async function getAll(req, res, next) {
@@ -134,6 +135,10 @@ async function getOne(req, res, next) {
       } catch (__) {}
     }
 
+    // Reliquat des fonds de prêt reporté des réunions validées précédentes
+    let reliquat_precedent = 0
+    try { reliquat_precedent = await reliquatPrecedent(pool, id) } catch (_) {}
+
     res.json({
       success: true,
       data: {
@@ -142,6 +147,7 @@ async function getOne(req, res, next) {
         cotisations_rubrique: cotisationsRubrique,
         references_paiement:  referencesPaiement,
         souscriptions_garantie: souscriptionsGarantie,
+        reliquat_precedent,
         beneficiaires, echeances, sanctions, prets_session: pretsSession
       }
     })
@@ -254,7 +260,7 @@ async function sauvegarder(req, res, next) {
       cotisations_tontine = [],
       cotisations_rubrique = [],
       echeances = [],
-      montants_membres = {},     // { [tontine_id]: montant_membre } pour présence split
+      beneficiaires = [],        // [{ id?, tontine_id, membre_id, montant_membre }] multi-bénéficiaires
       references_paiement = {},  // { [membre_id]: 'réf MoMo/OM' } référence transaction par membre
       montant_rafraichissement
     } = req.body
@@ -323,12 +329,34 @@ async function sauvegarder(req, res, next) {
       )
     }
 
-    // Présence split : montant_membre par tontine
-    for (const [tontine_id, montant_membre] of Object.entries(montants_membres)) {
-      await conn.query(
-        'UPDATE beneficiaires SET montant_membre=? WHERE reunion_id=? AND tontine_id=?',
-        [montant_membre || null, id, tontine_id]
-      )
+    // Bénéficiaires (multi) : synchronisation de la liste envoyée par le frontend.
+    // On supprime d'abord ceux qui ne sont plus dans la liste, puis upsert.
+    if (Array.isArray(beneficiaires)) {
+      const keptIds = beneficiaires.filter(b => b.id).map(b => Number(b.id))
+      if (keptIds.length) {
+        await conn.query(
+          `DELETE FROM beneficiaires WHERE reunion_id=? AND id NOT IN (${keptIds.map(() => '?').join(',')})`,
+          [id, ...keptIds]
+        )
+      } else {
+        await conn.query('DELETE FROM beneficiaires WHERE reunion_id=?', [id])
+      }
+      for (const b of beneficiaires) {
+        const membre_id = b.membre_id ? Number(b.membre_id) : null
+        const mm = (b.montant_membre === '' || b.montant_membre === null || b.montant_membre === undefined)
+          ? null : Number(b.montant_membre)
+        if (b.id) {
+          await conn.query(
+            'UPDATE beneficiaires SET membre_id=?, montant_membre=? WHERE id=? AND reunion_id=?',
+            [membre_id, mm, Number(b.id), id]
+          )
+        } else if (b.tontine_id) {
+          await conn.query(
+            'INSERT INTO beneficiaires (reunion_id, tontine_id, membre_id, montant_membre) VALUES (?, ?, ?, ?)',
+            [id, b.tontine_id, membre_id, mm]
+          )
+        }
+      }
     }
 
     // Références de paiement Mobile Money par membre (upsert si non vide, sinon suppression)
@@ -602,43 +630,56 @@ async function valider(req, res, next) {
         VALUES (?, 'ENTREE', 'AUTRE', ?, ?, ?)`,
         [reunion.date_reunion, pretTotal, `Remboursements prêts – ${dateLabel}`, id])
     }
-    // Sorties bénéficiaires tontines
-    const [beneficiaires] = await conn.query(`
-      SELECT b.*, t.nom AS nom_tontine, t.type AS type_tontine,
-        m.nom AS bnom, m.prenom AS bprenom,
-        COALESCE(SUM(CASE WHEN ct.est_echec=0 THEN ct.montant_paye ELSE 0 END),0) AS pot
+    // ── 6b. Sorties bénéficiaires (multi-bénéficiaires) ──
+    // Pot collecté par tontine (calcul séparé pour éviter tout double-comptage).
+    const [potRows] = await conn.query(
+      `SELECT tontine_id, COALESCE(SUM(CASE WHEN est_echec=0 THEN montant_paye ELSE 0 END),0) AS pot
+       FROM cotisations_tontine WHERE reunion_id=? GROUP BY tontine_id`, [id]
+    )
+    const potParTontine = Object.fromEntries(potRows.map(r => [r.tontine_id, Number(r.pot)]))
+
+    // Bénéficiaires désignés (sans agrégation des cotisations), groupés par tontine.
+    const [benefs] = await conn.query(`
+      SELECT b.id, b.tontine_id, b.membre_id, b.montant_membre,
+             t.nom AS nom_tontine, t.type AS type_tontine, t.tour_actuel,
+             m.nom AS bnom, m.prenom AS bprenom
       FROM beneficiaires b
       JOIN tontines t ON t.id = b.tontine_id
       LEFT JOIN membres m ON m.id = b.membre_id
-      LEFT JOIN cotisations_tontine ct ON ct.reunion_id=b.reunion_id AND ct.tontine_id=b.tontine_id
       WHERE b.reunion_id=? AND b.membre_id IS NOT NULL
-      GROUP BY b.tontine_id, b.membre_id
+      ORDER BY b.tontine_id, b.id
     `, [id])
 
-    for (const b of beneficiaires) {
-      // Pour la PRESENCE : utilise montant_membre si défini, sinon pot complet
-      const sortie = (b.type_tontine === 'PRESENCE' && b.montant_membre !== null)
-        ? b.montant_membre
-        : b.pot
-      if (sortie > 0) {
+    const benefsParTontine = {}
+    for (const b of benefs) (benefsParTontine[b.tontine_id] = benefsParTontine[b.tontine_id] || []).push(b)
+
+    // Montant par bénéficiaire : montant_membre si saisi, sinon part équitable du pot.
+    for (const [tid, liste] of Object.entries(benefsParTontine)) {
+      const parts = repartirEgal(potParTontine[tid] || 0, liste.length)
+      liste.forEach((b, i) => {
+        b._sortie = (b.montant_membre !== null && b.montant_membre !== undefined)
+          ? Number(b.montant_membre)
+          : parts[i]
+      })
+    }
+
+    for (const b of benefs) {
+      if (b._sortie > 0) {
         await conn.query(`INSERT INTO mouvements_caisse (date_mvt, type_mvt, categorie, montant, description, reunion_id)
           VALUES (?, 'SORTIE', 'COTISATION_TONTINE', ?, ?, ?)`,
-          [reunion.date_reunion, sortie, `Bénéficiaire ${b.nom_tontine} – ${b.bprenom} ${b.bnom}`, id])
+          [reunion.date_reunion, b._sortie, `Bénéficiaire ${b.nom_tontine} – ${b.bprenom} ${b.bnom}`, id])
       }
     }
 
     // ── 7. Historique bénéficiaires + incrément nb_reunions_tour ──
     try {
-      for (const b of beneficiaires) {
-        const sortie = (b.type_tontine === 'PRESENCE' && b.montant_membre !== null)
-          ? b.montant_membre : b.pot
-        if (sortie > 0) {
-          const [[t]] = await conn.query('SELECT tour_actuel FROM tontines WHERE id=?', [b.tontine_id])
+      for (const b of benefs) {
+        if (b._sortie > 0) {
           await conn.query(`
             INSERT INTO historique_beneficiaires
               (tontine_id, membre_id, tour, reunion_id, montant_recu)
             VALUES (?, ?, ?, ?, ?)
-          `, [b.tontine_id, b.membre_id, t?.tour_actuel || 1, id, sortie])
+          `, [b.tontine_id, b.membre_id, b.tour_actuel || 1, id, b._sortie])
         }
       }
       await conn.query(

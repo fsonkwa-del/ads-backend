@@ -1,5 +1,6 @@
 const pool = require('../config/db')
 const { arrondirFCFA } = require('../utils/money')
+const { reliquatPrecedent } = require('../utils/reliquat')
 
 // ── Lecture d'un paramètre système ───────────────────────────
 async function getParam(conn_or_pool, cle, defaut) {
@@ -171,7 +172,10 @@ async function create(req, res, next) {
         'SELECT COALESCE(SUM(montant_capital),0) AS deja FROM prets WHERE reunion_octroi_id=?',
         [reunion_octroi_id]
       )
-      const disponible = Number(banque) + remboursements - Number(deja)
+      // Reliquat reporté des séances validées précédentes (fonds non prêtés)
+      let reliquat = 0
+      try { reliquat = await reliquatPrecedent(pool, reunion_octroi_id) } catch (_) {}
+      const disponible = reliquat + Number(banque) + remboursements - Number(deja)
       if (Number(montant_capital) > disponible)
         return res.status(400).json({
           success: false,

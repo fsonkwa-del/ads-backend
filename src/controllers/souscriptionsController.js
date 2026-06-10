@@ -1,4 +1,5 @@
 const pool = require('../config/db')
+const { repartirEgal } = require('../utils/money')
 
 // GET /api/souscriptions[?tontine_id=X&membre_id=Y&statut=ACTIVE]
 async function getAll(req, res, next) {
@@ -101,18 +102,14 @@ async function souscrireInterne(conn, { tontine, membre, nb_parts, date_souscrip
   const dateRefTour = tontine.date_debut_tour
     || new Date(tontine.created_at).toISOString().split('T')[0]
 
+  // Séances validées du tour (réunions DISTINCTES — pas de jointure bénéficiaires
+  // qui dupliquerait les lignes en cas de multi-bénéficiaires).
   const [seancesTenues] = await conn.query(`
-    SELECT
-      r.id AS reunion_id, r.date_reunion,
-      b.membre_id AS beneficiaire_id,
-      CONCAT(mb.prenom, ' ', mb.nom) AS beneficiaire
+    SELECT r.id AS reunion_id, r.date_reunion
     FROM reunions r
-    LEFT JOIN beneficiaires b  ON b.reunion_id = r.id AND b.tontine_id = ?
-    LEFT JOIN membres mb       ON mb.id = b.membre_id
-    WHERE r.statut = 'VALIDEE'
-      AND r.date_reunion >= ?
+    WHERE r.statut = 'VALIDEE' AND r.date_reunion >= ?
     ORDER BY r.date_reunion
-  `, [tontine_id, dateRefTour])
+  `, [dateRefTour])
 
   let montantTotal = 0
   const rattrapageDetail = []
@@ -127,13 +124,7 @@ async function souscrireInterne(conn, { tontine, membre, nb_parts, date_souscrip
       VALUES (?, ?, ?, ?, ?, ?, 0)
     `, [seance.reunion_id, membre.id, tontine_id, nb_parts, nb_parts, montant])
 
-    rattrapageDetail.push({
-      reunion_id:      seance.reunion_id,
-      date_reunion:    seance.date_reunion,
-      montant,
-      beneficiaire:    seance.beneficiaire || null,
-      beneficiaire_id: seance.beneficiaire_id || null
-    })
+    rattrapageDetail.push({ reunion_id: seance.reunion_id, date_reunion: seance.date_reunion, montant })
   }
 
   if (montantTotal > 0) {
@@ -147,17 +138,20 @@ async function souscrireInterne(conn, { tontine, membre, nb_parts, date_souscrip
       `Rattrapage adhésion – ${membre.prenom} ${membre.nom} – ${tontine.nom} (tour ${tourActuel})`
     ])
 
-    // SORTIE par séance vers le bénéficiaire d'origine
+    // SORTIE par séance, répartie équitablement entre les bénéficiaires d'origine de la séance
     for (const seance of rattrapageDetail) {
-      if (seance.beneficiaire_id) {
+      const [benefsSeance] = await conn.query(
+        `SELECT mb.prenom, mb.nom FROM beneficiaires b JOIN membres mb ON mb.id = b.membre_id
+         WHERE b.reunion_id = ? AND b.tontine_id = ? AND b.membre_id IS NOT NULL`,
+        [seance.reunion_id, tontine_id]
+      )
+      if (!benefsSeance.length) continue
+      const parts = repartirEgal(seance.montant, benefsSeance.length)
+      for (let i = 0; i < benefsSeance.length; i++) {
         await conn.query(`
           INSERT INTO mouvements_caisse (date_mvt, type_mvt, categorie, montant, description)
           VALUES (?, 'SORTIE', 'COTISATION_TONTINE', ?, ?)
-        `, [
-          date_souscription,
-          nb_parts * tontine.montant_par_part,
-          `Redistribution rattrapage – ${seance.beneficiaire} – ${tontine.nom} (réunion #${seance.reunion_id})`
-        ])
+        `, [date_souscription, parts[i], `Redistribution rattrapage – ${benefsSeance[i].prenom} ${benefsSeance[i].nom} – ${tontine.nom} (réunion #${seance.reunion_id})`])
       }
     }
 
@@ -389,19 +383,14 @@ async function augmenterParts(req, res, next) {
       [partsAdd, id]
     )
 
-    // Séances depuis la date de souscription (tour courant de ce membre)
+    // Séances depuis la date de souscription (réunions DISTINCTES — pas de jointure
+    // bénéficiaires qui dupliquerait les lignes en cas de multi-bénéficiaires).
     const [seancesTenues] = await conn.query(`
-      SELECT
-        r.id AS reunion_id, r.date_reunion,
-        b.membre_id AS beneficiaire_id,
-        CONCAT(mb.prenom, ' ', mb.nom) AS beneficiaire
+      SELECT r.id AS reunion_id, r.date_reunion
       FROM reunions r
-      LEFT JOIN beneficiaires b  ON b.reunion_id = r.id AND b.tontine_id = ?
-      LEFT JOIN membres mb       ON mb.id = b.membre_id
-      WHERE r.statut = 'VALIDEE'
-        AND r.date_reunion >= ?
+      WHERE r.statut = 'VALIDEE' AND r.date_reunion >= ?
       ORDER BY r.date_reunion
-    `, [souscription.tontine_id, souscription.date_souscription])
+    `, [souscription.date_souscription])
 
     let montantTotal = 0
     const rattrapageDetail = []
@@ -432,13 +421,7 @@ async function augmenterParts(req, res, next) {
         `, [seance.reunion_id, souscription.membre_id, souscription.tontine_id, partsAdd, partsAdd, montant])
       }
 
-      rattrapageDetail.push({
-        reunion_id:      seance.reunion_id,
-        date_reunion:    seance.date_reunion,
-        montant,
-        beneficiaire:    seance.beneficiaire || null,
-        beneficiaire_id: seance.beneficiaire_id || null
-      })
+      rattrapageDetail.push({ reunion_id: seance.reunion_id, date_reunion: seance.date_reunion, montant })
     }
 
     if (montantTotal > 0) {
@@ -452,17 +435,20 @@ async function augmenterParts(req, res, next) {
         `Rattrapage augmentation parts (+${partsAdd}) – ${souscription.membre_prenom} ${souscription.membre_nom} – ${souscription.nom_tontine}`
       ])
 
-      // SORTIE par séance vers le bénéficiaire d'origine
+      // SORTIE par séance, répartie équitablement entre les bénéficiaires de la séance
       for (const seance of rattrapageDetail) {
-        if (seance.beneficiaire_id) {
+        const [benefsSeance] = await conn.query(
+          `SELECT mb.prenom, mb.nom FROM beneficiaires b JOIN membres mb ON mb.id = b.membre_id
+           WHERE b.reunion_id = ? AND b.tontine_id = ? AND b.membre_id IS NOT NULL`,
+          [seance.reunion_id, souscription.tontine_id]
+        )
+        if (!benefsSeance.length) continue
+        const parts = repartirEgal(seance.montant, benefsSeance.length)
+        for (let i = 0; i < benefsSeance.length; i++) {
           await conn.query(`
             INSERT INTO mouvements_caisse (date_mvt, type_mvt, categorie, montant, description)
             VALUES (?, 'SORTIE', 'COTISATION_TONTINE', ?, ?)
-          `, [
-            date_paiement,
-            partsAdd * souscription.montant_par_part,
-            `Redistribution augmentation – ${seance.beneficiaire} – ${souscription.nom_tontine} (réunion #${seance.reunion_id})`
-          ])
+          `, [date_paiement, parts[i], `Redistribution augmentation – ${benefsSeance[i].prenom} ${benefsSeance[i].nom} – ${souscription.nom_tontine} (réunion #${seance.reunion_id})`])
         }
       }
 

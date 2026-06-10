@@ -16,12 +16,25 @@ const caisseRoutes        = require('./routes/caisse')
 const rapportsRoutes      = require('./routes/rapports')
 const sanctionsRoutes     = require('./routes/sanctions')
 const bureauRoutes        = require('./routes/bureau')
+const authRoutes          = require('./routes/auth')
+const utilisateursRoutes  = require('./routes/utilisateurs')
+const { auth, authorize } = require('./middleware/auth')
 
 const app = express()
 
 app.use(cors())
 app.use(express.json())
 app.use('/uploads', express.static('uploads'))
+
+// ── Routes publiques ──────────────────────────────────────────
+app.use('/api/auth', authRoutes)
+app.get('/api/health', (req, res) => {
+  res.json({ success: true, message: 'ADS API opérationnelle' })
+})
+
+// ── À partir d'ici : authentification + autorisation par rôle ──
+app.use(auth)
+app.use(authorize)
 
 // Routes
 app.use('/api/membres',       membresRoutes)
@@ -37,11 +50,7 @@ app.use('/api/caisse',       caisseRoutes)
 app.use('/api/rapports',    rapportsRoutes)
 app.use('/api/sanctions',   sanctionsRoutes)
 app.use('/api/bureau',      bureauRoutes)
-
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ success: true, message: 'ADS API opérationnelle' })
-})
+app.use('/api/utilisateurs', utilisateursRoutes)
 
 app.use(errorHandler)
 

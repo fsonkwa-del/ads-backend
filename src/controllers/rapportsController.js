@@ -1,6 +1,8 @@
 const pool   = require('../config/db')
 const ExcelJS = require('exceljs')
 const PDFDocument = require('pdfkit')
+const { repartirEgal } = require('../utils/money')
+const { reliquatPrecedent } = require('../utils/reliquat')
 
 // ── Format helpers ────────────────────────────────────────────
 // toLocaleString('fr-FR') produit des espaces insécables (U+00A0) que PDFKit rend en '/'.
@@ -279,21 +281,31 @@ async function getReunionData(id) {
   }
   const grille = Object.values(map).sort((a, b) => a.nom.localeCompare(b.nom))
 
-  const [benefs] = await pool.query(`
-    SELECT b.tontine_id, b.membre_id, b.montant_membre,
-           t.nom AS nom_tontine, t.type AS type_tontine,
-           m.nom, m.prenom,
-           COALESCE(SUM(CASE WHEN ct.est_echec=0 THEN ct.montant_paye ELSE 0 END),0) AS pot
+  // Pot par tontine (calcul séparé pour éviter le double-comptage en multi-bénéficiaires)
+  const [potRows] = await pool.query(
+    `SELECT tontine_id, COALESCE(SUM(CASE WHEN est_echec=0 THEN montant_paye ELSE 0 END),0) AS pot
+     FROM cotisations_tontine WHERE reunion_id=? GROUP BY tontine_id`, [id]
+  )
+  const potParTontine = Object.fromEntries(potRows.map(r => [r.tontine_id, Number(r.pot)]))
+
+  const [benefsRows] = await pool.query(`
+    SELECT b.id, b.tontine_id, b.membre_id, b.montant_membre,
+           t.nom AS nom_tontine, t.type AS type_tontine, m.nom, m.prenom
     FROM beneficiaires b JOIN tontines t ON t.id=b.tontine_id
     LEFT JOIN membres m ON m.id=b.membre_id
-    LEFT JOIN cotisations_tontine ct ON ct.reunion_id=b.reunion_id AND ct.tontine_id=b.tontine_id
-    WHERE b.reunion_id=? AND b.membre_id IS NOT NULL GROUP BY b.tontine_id, b.membre_id
+    WHERE b.reunion_id=? AND b.membre_id IS NOT NULL
+    ORDER BY b.tontine_id, b.id
   `, [id])
-  const beneficiaires = benefs.map(b => ({
-    ...b,
-    montant_recu: (b.type_tontine === 'PRESENCE' && b.montant_membre !== null)
-      ? Number(b.montant_membre) : Number(b.pot)
-  }))
+  const benefsByTontine = {}
+  for (const b of benefsRows) (benefsByTontine[b.tontine_id] = benefsByTontine[b.tontine_id] || []).push(b)
+  const beneficiaires = []
+  for (const [tid, liste] of Object.entries(benefsByTontine)) {
+    const parts = repartirEgal(potParTontine[tid] || 0, liste.length)
+    liste.forEach((b, i) => beneficiaires.push({
+      ...b,
+      montant_recu: (b.montant_membre !== null && b.montant_membre !== undefined) ? Number(b.montant_membre) : parts[i]
+    }))
+  }
 
   let pretsOctroyes = []
   try {
@@ -327,9 +339,12 @@ async function getReunionData(id) {
   const totalEntrees = mouvs.filter(m => m.type_mvt === 'ENTREE').reduce((s, m) => s + Number(m.total), 0)
   const totalSorties = mouvs.filter(m => m.type_mvt === 'SORTIE').reduce((s, m) => s + Number(m.total), 0)
 
+  let reliquat_precedent = 0
+  try { reliquat_precedent = await reliquatPrecedent(pool, id) } catch (_) {}
+
   return {
     reunion, tontines, rubrique_types: rubTypes, grille, beneficiaires,
-    prets_octroyes: pretsOctroyes, sanctions,
+    prets_octroyes: pretsOctroyes, sanctions, reliquat_precedent,
     recap: { total_entrees: totalEntrees, total_sorties: totalSorties,
              rafraichissement: Number(reunion.montant_rafraichissement || 0),
              solde_net: totalEntrees - totalSorties, par_categorie: mouvs }

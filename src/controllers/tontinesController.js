@@ -127,20 +127,46 @@ async function remove(req, res, next) {
   try {
     const { id } = req.params
 
-    const [[{ nb }]] = await pool.query(
-      'SELECT COUNT(*) AS nb FROM souscriptions WHERE tontine_id = ?', [id]
+    const [[tontine]] = await pool.query('SELECT id, tour_actuel FROM tontines WHERE id = ?', [id])
+    if (!tontine) return res.status(404).json({ success: false, message: 'Tontine introuvable' })
+    const tour = tontine.tour_actuel || 1
+
+    // Blocage si le tour actuel n'est pas terminé : tous les souscripteurs actifs
+    // de ce tour doivent avoir perçu leur lot (présents dans historique_beneficiaires).
+    const [[{ nbSous }]] = await pool.query(
+      "SELECT COUNT(*) AS nbSous FROM souscriptions WHERE tontine_id = ? AND statut = 'ACTIVE' AND tour = ?",
+      [id, tour]
     )
-    if (nb > 0)
+    let nbBenef = 0
+    try {
+      const [[r]] = await pool.query(
+        'SELECT COUNT(DISTINCT membre_id) AS nbBenef FROM historique_beneficiaires WHERE tontine_id = ? AND tour = ?',
+        [id, tour]
+      )
+      nbBenef = Number(r.nbBenef)
+    } catch (_) { /* table absente */ }
+
+    if (nbBenef < nbSous) {
       return res.status(400).json({
         success: false,
-        message: 'Impossible de supprimer : des souscriptions existent pour cette tontine'
+        message: "Impossible de supprimer la tontine : le tour actuel n'est pas terminé (tous les bénéficiaires n'ont pas encore reçu leur lot)."
       })
+    }
 
-    const [result] = await pool.query('DELETE FROM tontines WHERE id = ?', [id])
-    if (!result.affectedRows)
-      return res.status(404).json({ success: false, message: 'Tontine introuvable' })
-
-    res.json({ success: true, message: 'Tontine supprimée' })
+    try {
+      const [result] = await pool.query('DELETE FROM tontines WHERE id = ?', [id])
+      if (!result.affectedRows)
+        return res.status(404).json({ success: false, message: 'Tontine introuvable' })
+      res.json({ success: true, message: 'Tontine supprimée' })
+    } catch (e) {
+      if (e.errno === 1451) {
+        return res.status(400).json({
+          success: false,
+          message: 'Impossible de supprimer : des données (souscriptions, cotisations, historique) référencent encore cette tontine.'
+        })
+      }
+      throw e
+    }
   } catch (err) {
     next(err)
   }

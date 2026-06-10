@@ -1,5 +1,6 @@
 const pool = require('../config/db')
 const { arrondirFCFA } = require('../utils/money')
+const { disponiblePrets } = require('../utils/reliquat')
 
 // ── GET /api/caisse/soldes ────────────────────────────────────
 async function getSoldes(req, res, next) {
@@ -52,6 +53,10 @@ async function getTresorerie(req, res, next) {
       prets_en_cours = Number(p.v)
     } catch (_) {}
 
+    // Disponible prêts à préparer : reliquat reporté + collecte de la séance en cours
+    let disponible_prets = 0
+    try { disponible_prets = await disponiblePrets(pool) } catch (_) {}
+
     res.json({
       success: true,
       data: {
@@ -61,6 +66,7 @@ async function getTresorerie(req, res, next) {
         total_entrees:       Number(flux.entrees),
         total_sorties:       Number(flux.sorties),
         prets_en_cours,
+        disponible_prets,
       }
     })
   } catch (err) { next(err) }
