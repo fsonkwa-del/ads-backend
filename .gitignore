@@ -1,0 +1,16 @@
+# Dépendances
+node_modules/
+
+# Secrets / configuration locale  (copier .env.example → .env)
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Données utilisateur (photos des membres) — recréer le dossier au déploiement
+uploads/
+
+# Divers
+.DS_Store
