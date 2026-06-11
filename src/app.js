@@ -23,7 +23,8 @@ const { auth, authorize } = require('./middleware/auth')
 
 const app = express()
 
-app.use(cors())
+// CORS : restreint au frontend si CORS_ORIGIN est défini, sinon ouvert (démo).
+app.use(cors({ origin: process.env.CORS_ORIGIN || true }))
 app.use(express.json())
 app.use('/uploads', express.static('uploads'))
 

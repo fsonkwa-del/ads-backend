@@ -12,5 +12,12 @@ logs/
 # Données utilisateur (photos des membres) — recréer le dossier au déploiement
 uploads/
 
+# Dumps de base de données (contiennent données + hashes — ne pas versionner)
+*_dump.sql
+*.sql.gz
+
+# Fichiers temporaires de test
+_tmp_*.js
+
 # Divers
 .DS_Store
