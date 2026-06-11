@@ -23,6 +23,22 @@ const mysql = require('mysql2/promise')
     return n > 0
   }
 
+  const tableExists = async (table) => {
+    const [[{ n }]] = await conn.query(
+      'SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?',
+      [table]
+    )
+    return n > 0
+  }
+
+  const idxExists = async (table, idx) => {
+    const [[{ n }]] = await conn.query(
+      'SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?',
+      [table, idx]
+    )
+    return n > 0
+  }
+
   // ── Membres KYC — colonnes supplémentaires ────────────────────
   const kyc = [
     ['date_naissance',          'DATE NULL'],
@@ -123,6 +139,41 @@ const mysql = require('mysql2/promise')
   if (!(await colExists('reunions','montant_amende_reouverture')))
     await run('ALTER reunions ADD montant_amende_reouverture', 'ALTER TABLE reunions ADD COLUMN montant_amende_reouverture INT NOT NULL DEFAULT 0')
   else console.log('ℹ️  reunions.montant_amende_reouverture déjà présent')
+
+  // ── Phase 5+ : soft delete utilisateurs / membres ────────────
+  if (!(await colExists('membres', 'deleted')))
+    await run('ALTER membres ADD deleted', 'ALTER TABLE membres ADD COLUMN deleted INT UNSIGNED NOT NULL DEFAULT 0')
+  else console.log('ℹ️  membres.deleted déjà présent')
+
+  if (await tableExists('utilisateurs')) {
+    if (!(await colExists('utilisateurs', 'deleted')))
+      await run('ALTER utilisateurs ADD deleted', 'ALTER TABLE utilisateurs ADD COLUMN deleted INT UNSIGNED NOT NULL DEFAULT 0')
+    else console.log('ℹ️  utilisateurs.deleted déjà présent')
+
+    // Index uniques composites (créés AVANT de retirer les anciens : la FK membre_id
+    // et l'unicité login restent couvertes par les nouveaux index).
+    if (!(await idxExists('utilisateurs', 'login_deleted')))
+      await run('ADD UNIQUE login_deleted', 'ALTER TABLE utilisateurs ADD UNIQUE KEY login_deleted (login, deleted)')
+    else console.log('ℹ️  index login_deleted déjà présent')
+
+    if (!(await idxExists('utilisateurs', 'membre_id_deleted')))
+      await run('ADD UNIQUE membre_id_deleted', 'ALTER TABLE utilisateurs ADD UNIQUE KEY membre_id_deleted (membre_id, deleted)')
+    else console.log('ℹ️  index membre_id_deleted déjà présent')
+
+    if (await idxExists('utilisateurs', 'login'))
+      await run('DROP INDEX login', 'ALTER TABLE utilisateurs DROP INDEX login')
+    if (await idxExists('utilisateurs', 'membre_id'))
+      await run('DROP INDEX membre_id', 'ALTER TABLE utilisateurs DROP INDEX membre_id')
+  } else {
+    console.log('ℹ️  table utilisateurs absente — exécuter migration_phase5_utilisateurs.sql + seed')
+  }
+
+  // ── Phase 7 : journal d'audit ─────────────────────────────────
+  await run('CREATE journaux_audit', `CREATE TABLE IF NOT EXISTS journaux_audit (
+    id INT AUTO_INCREMENT PRIMARY KEY, utilisateur_id INT NULL, action VARCHAR(100) NOT NULL,
+    table_cible VARCHAR(50) NOT NULL, id_cible INT NOT NULL, details TEXT NULL,
+    ip_adresse VARCHAR(45) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id) ON DELETE SET NULL)`)
 
   await conn.end()
   console.log('\nMigration complète.')

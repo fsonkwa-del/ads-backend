@@ -1,6 +1,7 @@
 const pool   = require('../config/db')
 const bcrypt = require('bcryptjs')
 const jwt    = require('jsonwebtoken')
+const { logAudit } = require('../utils/audit')
 
 const SECRET  = process.env.JWT_SECRET
 const EXPIRES = process.env.JWT_EXPIRES || '12h'
@@ -12,11 +13,21 @@ async function login(req, res, next) {
     if (!login || !mot_de_passe)
       return res.status(400).json({ success: false, message: 'Identifiant et mot de passe requis.' })
 
-    const [[u]] = await pool.query('SELECT * FROM utilisateurs WHERE login = ?', [login])
-    if (!u || !u.actif || !(await bcrypt.compare(mot_de_passe, u.mot_de_passe)))
+    const [[u]] = await pool.query('SELECT * FROM utilisateurs WHERE login = ? AND deleted = 0', [login])
+    const ok = u && u.actif && (await bcrypt.compare(mot_de_passe, u.mot_de_passe))
+    if (!ok) {
+      await logAudit(pool, {
+        utilisateur_id: u?.id || null, action: 'LOGIN_ECHEC', table_cible: 'utilisateurs',
+        id_cible: u?.id || 0, details: { login }, ip_adresse: req.ip,
+      })
       return res.status(401).json({ success: false, message: 'Identifiants invalides.' })
+    }
 
     await pool.query('UPDATE utilisateurs SET derniere_connexion = NOW() WHERE id = ?', [u.id])
+    await logAudit(pool, {
+      utilisateur_id: u.id, action: 'LOGIN', table_cible: 'utilisateurs',
+      id_cible: u.id, details: { login: u.login, role: u.role }, ip_adresse: req.ip,
+    })
     const payload = { id: u.id, membre_id: u.membre_id, role: u.role, login: u.login }
     const token = jwt.sign(payload, SECRET, { expiresIn: EXPIRES })
     res.json({ success: true, data: { token, user: { ...payload, doit_changer_mdp: !!u.doit_changer_mdp } } })
@@ -27,7 +38,7 @@ async function login(req, res, next) {
 async function me(req, res, next) {
   try {
     const [[u]] = await pool.query(
-      'SELECT id, membre_id, login, role, doit_changer_mdp FROM utilisateurs WHERE id = ?',
+      'SELECT id, membre_id, login, role, doit_changer_mdp FROM utilisateurs WHERE id = ? AND deleted = 0',
       [req.user.id]
     )
     if (!u) return res.status(404).json({ success: false, message: 'Compte introuvable.' })
@@ -42,12 +53,16 @@ async function changePassword(req, res, next) {
     if (!nouveau || String(nouveau).length < 4)
       return res.status(400).json({ success: false, message: 'Le nouveau mot de passe doit faire au moins 4 caractères.' })
 
-    const [[u]] = await pool.query('SELECT mot_de_passe FROM utilisateurs WHERE id = ?', [req.user.id])
+    const [[u]] = await pool.query('SELECT mot_de_passe FROM utilisateurs WHERE id = ? AND deleted = 0', [req.user.id])
     if (!u || !(await bcrypt.compare(ancien || '', u.mot_de_passe)))
       return res.status(400).json({ success: false, message: 'Ancien mot de passe incorrect.' })
 
     const hash = await bcrypt.hash(String(nouveau), 10)
     await pool.query('UPDATE utilisateurs SET mot_de_passe = ?, doit_changer_mdp = 0 WHERE id = ?', [hash, req.user.id])
+    await logAudit(pool, {
+      utilisateur_id: req.user.id, action: 'CHANGEMENT_MDP', table_cible: 'utilisateurs',
+      id_cible: req.user.id, details: 'Mot de passe modifié par l\'utilisateur', ip_adresse: req.ip,
+    })
     res.json({ success: true, message: 'Mot de passe modifié.' })
   } catch (err) { next(err) }
 }

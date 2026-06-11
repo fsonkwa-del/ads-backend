@@ -25,12 +25,12 @@ async function run() {
   )
 
   // Un compte LECTEUR par membre actif sans compte
-  const [membres]  = await pool.query("SELECT id, nom, prenom FROM membres WHERE statut='ACTIF'")
-  const [existing] = await pool.query('SELECT login FROM utilisateurs')
+  const [membres]  = await pool.query("SELECT id, nom, prenom FROM membres WHERE statut='ACTIF' AND deleted = 0")
+  const [existing] = await pool.query('SELECT login FROM utilisateurs WHERE deleted = 0')
   const used = new Set(existing.map(u => u.login))
   let created = 0
   for (const m of membres) {
-    const [[has]] = await pool.query('SELECT id FROM utilisateurs WHERE membre_id = ?', [m.id])
+    const [[has]] = await pool.query('SELECT id FROM utilisateurs WHERE membre_id = ? AND deleted = 0', [m.id])
     if (has) continue
     const base = slug(`${m.prenom}.${m.nom}`) || `membre${m.id}`
     let login = base, n = 1

@@ -1,4 +1,5 @@
 const pool = require('../config/db')
+const { logAudit } = require('../utils/audit')
 
 const KYC_FIELDS = [
   'nom','prenom','telephone','date_adhesion','statut','observations',
@@ -20,7 +21,8 @@ function pickKyc(body) {
 // `excludeId` permet d'ignorer le membre courant lors d'une modification.
 async function findDoublons(db, { nom, prenom, telephone, numero_pid }, excludeId = null) {
   const conflicts = []
-  const exclude = excludeId ? ' AND id <> ?' : ''
+  // Les membres supprimés (logiquement) ne bloquent pas un nouvel enregistrement
+  const exclude = ' AND deleted = 0' + (excludeId ? ' AND id <> ?' : '')
   const tail    = excludeId ? [excludeId] : []
 
   if (nom && prenom) {
@@ -56,7 +58,7 @@ async function findDoublons(db, { nom, prenom, telephone, numero_pid }, excludeI
 // GET /api/membres
 async function getAll(req, res, next) {
   try {
-    const [rows] = await pool.query('SELECT * FROM membres ORDER BY nom, prenom')
+    const [rows] = await pool.query('SELECT * FROM membres WHERE deleted = 0 ORDER BY nom, prenom')
     res.json({ success: true, data: rows })
   } catch (err) { next(err) }
 }
@@ -64,7 +66,7 @@ async function getAll(req, res, next) {
 // GET /api/membres/:id
 async function getOne(req, res, next) {
   try {
-    const [[row]] = await pool.query('SELECT * FROM membres WHERE id = ?', [req.params.id])
+    const [[row]] = await pool.query('SELECT * FROM membres WHERE id = ? AND deleted = 0', [req.params.id])
     if (!row) return res.status(404).json({ success: false, message: 'Membre introuvable' })
     res.json({ success: true, data: row })
   } catch (err) { next(err) }
@@ -214,11 +216,19 @@ async function uploadPhoto(req, res, next) {
 }
 
 // DELETE /api/membres/:id
+// DELETE /api/membres/:id  — suppression logique (soft delete), historique préservé
 async function remove(req, res, next) {
   try {
-    const [result] = await pool.query('DELETE FROM membres WHERE id = ?', [req.params.id])
-    if (!result.affectedRows)
-      return res.status(404).json({ success: false, message: 'Membre introuvable' })
+    const { id } = req.params
+    const motif = req.body?.motif || req.body?.details || null
+    const [[m]] = await pool.query('SELECT id, nom, prenom FROM membres WHERE id = ? AND deleted = 0', [id])
+    if (!m) return res.status(404).json({ success: false, message: 'Membre introuvable' })
+
+    await pool.query('UPDATE membres SET deleted = id WHERE id = ?', [id])
+    await logAudit(pool, {
+      utilisateur_id: req.user?.id, action: 'SUPPRESSION_MEMBRE', table_cible: 'membres',
+      id_cible: Number(id), details: { nom: m.nom, prenom: m.prenom, motif }, ip_adresse: req.ip,
+    })
     res.json({ success: true, message: 'Membre supprimé' })
   } catch (err) { next(err) }
 }
