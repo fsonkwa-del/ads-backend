@@ -18,6 +18,7 @@ const sanctionsRoutes     = require('./routes/sanctions')
 const bureauRoutes        = require('./routes/bureau')
 const authRoutes          = require('./routes/auth')
 const utilisateursRoutes  = require('./routes/utilisateurs')
+const auditRoutes         = require('./routes/audit')
 const { auth, authorize } = require('./middleware/auth')
 
 const app = express()
@@ -51,6 +52,7 @@ app.use('/api/rapports',    rapportsRoutes)
 app.use('/api/sanctions',   sanctionsRoutes)
 app.use('/api/bureau',      bureauRoutes)
 app.use('/api/utilisateurs', utilisateursRoutes)
+app.use('/api/audit',        auditRoutes)
 
 app.use(errorHandler)
 
